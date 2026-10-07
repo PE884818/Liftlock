@@ -1,0 +1,17 @@
+.gradle/
+**/build/
+local.properties
+analysis/target/
+analysis/deps/
+tools/deps/
+*.jks
+*.keystore
+
+.kotlin/
+analysis/
+evidence/
+dist/
+design/
+__pycache__/
+*.pyc
+

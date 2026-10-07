@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Liftlock</string>
+    <string name="module_description">把 Flyme 的锁屏上滑手感带到澎湃 OS 4，保留原生界面与模糊</string>
+</resources>

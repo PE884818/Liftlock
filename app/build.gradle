@@ -1,0 +1,57 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+android {
+    namespace 'com.zhuanz.flymemotion'
+    compileSdk 37
+    defaultConfig {
+        applicationId 'com.zhuanz.flymemotion'
+        minSdk 34
+        targetSdk 37
+        versionCode 63
+        // SystemUI hook change. Hook receipts report TargetBuild.MODULE_VERSION (0.3.5-stage5).
+        versionName '0.3.5-miuix22'
+        testInstrumentationRunner providers.gradleProperty('portTestRunner').getOrElse('com.zhuanz.flymemotion.ManagerInstrumentation')
+    }
+    buildTypes {
+        release {
+            // Compose + miuix would otherwise ship ~40MB of unused library code. Module classes are kept
+            // whole and nothing is renamed (proguard-rules.pro), so the hook DEX keeps its names and members.
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.debug
+        }
+    }
+    buildFeatures { compose true }
+    androidResources { localeFilters += ['zh', 'en'] }
+    // Same bytecode level as 0.3.5 for the hook code. (miuix-nav is not used: its 0.9.4 inline API needs JVM 21.)
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    // -PportTestBuildType=release runs the emulator instrumentation against the shipped R8 build.
+    testBuildType providers.gradleProperty('portTestBuildType').getOrElse('debug')
+    lint { abortOnError true }
+    // Client instrumentation is retained only as research source, never packaged or loaded.
+    sourceSets.main.java.exclude '**/NativeSurfaceFrame.java', '**/ClientFrameHooks.java'
+}
+dependencies {
+    implementation project(':motion-core')
+    compileOnly 'io.github.libxposed:api:101.0.0'
+    implementation 'io.github.libxposed:service:101.0.0'
+    implementation 'androidx.annotation:annotation:1.9.1'
+
+    implementation platform('androidx.compose:compose-bom:2026.08.00')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.11.0'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0'
+
+    def miuix = '0.9.4'
+    implementation "top.yukonga.miuix.kmp:miuix-ui-android:$miuix"
+    implementation "top.yukonga.miuix.kmp:miuix-preference-android:$miuix"
+    implementation "top.yukonga.miuix.kmp:miuix-icons-android:$miuix"
+    implementation "top.yukonga.miuix.kmp:miuix-blur-android:$miuix"
+
+    testImplementation 'junit:junit:4.13.2'
+}

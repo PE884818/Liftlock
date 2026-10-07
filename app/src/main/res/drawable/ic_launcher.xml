@@ -1,0 +1,22 @@
+<!-- Flat copy of the adaptive icon (squircle mask) for in-app use, where adaptive XML cannot be painted. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="72dp" android:height="72dp" android:viewportWidth="72" android:viewportHeight="72">
+    <group android:translateX="-18" android:translateY="-18">
+        <path android:pathData="M54,18 C83,18 90,25 90,54 C90,83 83,90 54,90 C25,90 18,83 18,54 C18,25 25,18 54,18 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="linear" android:startX="18" android:startY="18" android:endX="90" android:endY="90"
+                    android:startColor="#18B596" android:endColor="#0B8A7A" />
+            </aapt:attr>
+        </path>
+        <group android:pivotX="54" android:pivotY="54" android:scaleX="0.8" android:scaleY="0.8">
+            <path android:fillColor="#FFFFFF" android:fillAlpha="0.38"
+                android:pathData="M43,40 H65 A8,8 0,0 1 73,48 V68 A8,8 0,0 1 65,76 H43 A8,8 0,0 1 35,68 V48 A8,8 0,0 1 43,40 Z" />
+            <path android:fillColor="#FFFFFF"
+                android:pathData="M43,28 H65 A8,8 0,0 1 73,36 V56 A8,8 0,0 1 65,64 H43 A8,8 0,0 1 35,56 V36 A8,8 0,0 1 43,28 Z" />
+            <path android:strokeColor="#0B8A7A" android:strokeAlpha="0.45" android:strokeWidth="5" android:strokeLineCap="round"
+                android:pathData="M45,40 H57" />
+            <path android:strokeColor="#0B8A7A" android:strokeWidth="3.5" android:strokeLineCap="round"
+                android:pathData="M47,56 H61" />
+        </group>
+    </group>
+</vector>

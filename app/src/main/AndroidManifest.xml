@@ -1,0 +1,26 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.android.systemui" />
+        <package android:name="com.android.settings" />
+        <package android:name="com.miui.miwallpaper" />
+        <package android:name="com.github.zyl6932.HyperMusicCover" />
+        <package android:name="com.kiminonawa.HyperLight" />
+        <package android:name="btm.m.os4.systemuihook" />
+        <package android:name="com.tencent.mm" />
+        <package android:name="com.eg.android.AlipayGphone" />
+    </queries>
+    <application android:name=".MotionApplication" android:label="@string/app_name"
+        android:description="@string/module_description" android:icon="@mipmap/ic_launcher"
+        android:theme="@style/AppTheme" android:allowBackup="false" android:dataExtractionRules="@xml/backup_rules" android:supportsRtl="true"
+        android:directBootAware="true" android:defaultToDeviceProtectedStorage="true">
+        <activity android:name=".ManagerActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".PageActivity" android:exported="false" />
+        <provider android:name=".RuntimeProvider" android:authorities="com.zhuanz.flymemotion.runtime"
+            android:exported="true" android:directBootAware="true" />
+    </application>
+</manifest>
