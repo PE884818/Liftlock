@@ -27,6 +27,8 @@ final class NativeWallpaperComposition {
     private long clampToken;
     private float cornerDp = Float.NaN;
     private int cornerPx;
+    /** Corner decisions logged; see {@link #begin}. */
+    private int cornerTrace;
     /** Null when the live mirror can be composed on this build; otherwise the missing member. */
     private final String missing;
     NativeWallpaperComposition(ClassLoader loader, RuntimeReporter reporter) throws ReflectiveOperationException {
@@ -78,6 +80,14 @@ final class NativeWallpaperComposition {
             this.cornerDp = cornerDp;
             cornerPx = cornerRadius == null ? 0 : Math.round(PanelCorner.radius(window, cornerDp));
             blurSheet.corner(cornerPx);
+            // The corner terms are otherwise invisible: shape() only ever leaves a radius on the
+            // surfaces, so a wrong dp, a density mismatch and a radius that never reached the
+            // transaction all look identical on screen (a square end). Report the decision itself,
+            // once per change, so "the corner did nothing" can be told apart from "it never got here".
+            if (cornerTrace++ < 4) reporter.diag = "corner dp=" + cornerDp + " px=" + cornerPx
+                    + " density=" + window.getResources().getDisplayMetrics().density
+                    + " panelDp=" + Math.round(PanelCorner.screenDp(window))
+                    + " method=" + (cornerRadius != null) + " | " + reporter.diag;
         }
         if (missing != null) { reporter.wallpaper = "壁纸跟随不可用：" + missing + " missing"; return false; }
         NativeSceneChannel.MirrorState next = channel.mirror();

@@ -42,7 +42,15 @@ import io.github.libxposed.api.XposedInterface;
 /** Target-specific adapter. All native touch dispatch, authentication and lifecycle callbacks proceed. */
 final class SystemUiHooks {
     private static final String PANEL = "com.android.systemui.shade.NotificationPanelViewController";
-    private static final String KEYGUARD = "com.android.keyguard.panel.KeyguardPanelViewController";
+    /**
+     * The class carrying the keyguard-side panel state, in the order builds have provided it.
+     * The inspected build has it as an object of its own; Android 15 HyperOS implements the same
+     * role inside the panel itself, which is why the second name exists. Only "does this class
+     * exist" is asked - no device and no version is consulted.
+     */
+    private static final String[] KEYGUARD = {
+            "com.android.keyguard.panel.KeyguardPanelViewController",
+            "com.android.systemui.shade.MiuiNotificationPanelViewController"};
     private final MotionModule module;
     private final ClassLoader loader;
     private final RuntimeReporter reporter;
@@ -71,6 +79,14 @@ final class SystemUiHooks {
     private boolean warmAppliedDismissible, warmReadyReported;
     private int warmWidth, warmHeight;
     private float renderedRawHeight = Float.NaN;
+    // Which name this build's keyguard host uses for each member; resolved once in install().
+    private String kgInteractive = "interactive", kgKeyguardShowing = "keyguardShowing",
+            kgKeyguardBouncerShowing = "keyguardBouncerShowing", kgKeyguardOccluded = "keyguardOccluded",
+            kgStatusBarState = "statusBarState", kgForegroundLayer = "keyguardForegroundLayer", kgInjector, kgShadeWindowView;
+    /** The per-frame height writer install() resolved (a build may have either of its two names). */
+    private Method heightWriter;
+    /** The class the panel hooks were installed on; a MIUI subclass redeclares some of its fields. */
+    private Class<?> panelType;
 
     private SharedPreferences prefs;
     private SharedPreferences.OnSharedPreferenceChangeListener prefsListener;
@@ -98,6 +114,8 @@ final class SystemUiHooks {
     private boolean sleeping;
     private boolean restoringNativeExpansion;
     private long bottomDownTime = -1;
+    /** Bounded so the region's own trace cannot flood the gesture journal. */
+    private int bottomTrace;
     private boolean wakeVisualsTaken;
     private final RevealGate reveal = new RevealGate();
     private float rawHeight, frameVelocity, startProgress = 1, retouchOffset;
@@ -161,7 +179,12 @@ final class SystemUiHooks {
         Features features = new Features(module, installed, reporter.compat);
         try {
             // ---- Core: the panel's own drag, release and fling. Missing any of these keeps native. ----
-            Class<?> panelClass = type(PANEL), keyguardClass = type(KEYGUARD);
+            Class<?> panelClass = type(PANEL);
+            panelType = panelClass;
+            Class<?> keyguardClass = Members.load(loader, KEYGUARD);
+            if (keyguardClass == null) throw new ClassNotFoundException(KEYGUARD[0]);
+            if (!KEYGUARD[0].equals(keyguardClass.getName()))
+                features.variant("面板拖动", "keyguard 宿主=" + keyguardClass.getName());
             Class<?> touchClass = type(PANEL + "$TouchHandler");
             Class<?> windowClass = type("com.android.systemui.shade.NotificationShadeWindowView");
             Method windowTouch = NativeReflection.method(windowClass, "dispatchTouchEvent", MotionEvent.class);
@@ -182,6 +205,14 @@ final class SystemUiHooks {
                     if (warming || session.active()) {
                         if (!eligible()) { abandonPose(); return; }
                         // Keep finger physics and clock pose; only replace revoked composition.
+                        //
+                        // The revoked composition is what was driving the panel/wallpaper pose, so
+                        // once the finger is up the pose must go back to rest here. Skipping it left
+                        // the sheet parked at its last translated position - the partial-black
+                        // lockscreen that followed a stuck slow swipe, where only the bottom strip of
+                        // the wallpaper was still on screen. During a live drag the next pre-draw
+                        // re-applies the pose, so this only fires after release.
+                        if (!session.touching()) restorePose();
                         liveScene.end(wallpaperMotion.retire());
                         reporter.wallpaperBound = false;
                         warmAppliedSession = warmAppliedGeneration = renderedMirrorSession = renderedMirrorGeneration = -1;
@@ -193,7 +224,14 @@ final class SystemUiHooks {
             // or the private method itself. Each lookup tries every shape this panel has had.
             Method touch = NativeReflection.method(touchClass, "onTouchEvent", MotionEvent.class);
             Method intercept = NativeReflection.method(touchClass, "onInterceptTouchEvent", MotionEvent.class);
-            Method drag = required(Members.suffixed(touchClass, "handleTouch", MotionEvent.class), "TouchHandler#handleTouch");
+            // MIUI's handler entry is handleMiuiTouch on HyperOS 2, handleTouch on HyperOS 4.
+            Method drag = Members.suffixed(touchClass, "handleTouch", MotionEvent.class);
+            if (drag == null) {
+                drag = Members.suffixed(touchClass, "handleMiuiTouch", MotionEvent.class);
+                if (drag != null) features.variant("面板拖动", "TouchHandler#handleMiuiTouch");
+            }
+            drag = required(drag, "TouchHandler#handleTouch");
+            Method dragCall = drag;
             initDown = Members.accessor(panelClass, "initDownStates", MotionEvent.class);
             if (initDown == null) initDown = staticContaining(panelClass, "initDownStates", panelClass, MotionEvent.class);
             if (initDown == null) {
@@ -206,19 +244,26 @@ final class SystemUiHooks {
             Method externalTouch = injectorClass == null ? null : NativeReflection.methodOrNull(injectorClass, "handleExternalTouch", MotionEvent.class);
             Method shadeTouch = NativeReflection.methodOrNull(panelClass, "handleShadeTouch", MotionEvent.class);
             // MIUI renamed AOSP's setExpandedHeightInternal; both are the per-frame height writer.
-            Method height = required(Members.method(panelClass, Members.Sig.of("setExpandedHeightInternalAosp", float.class),
+            Method height = required(withBody(Members.method(panelClass, Members.Sig.of("setExpandedHeightInternalAosp", float.class),
+                    Members.Sig.of("setExpandedHeightInternal", float.class)), keyguardClass,
+                    Members.Sig.of("setExpandedHeightInternalAosp", float.class),
                     Members.Sig.of("setExpandedHeightInternal", float.class)), "setExpandedHeightInternal");
+            heightWriter = height;
             Method fling = NativeReflection.method(panelClass, "flingToHeight", float.class, boolean.class, float.class, float.class, boolean.class);
             // MIUI isFalseTouch(int, float, float); AOSP isFalseTouch(float, float, int).
-            releaseFalseTouch = NativeReflection.methodOrNull(panelClass, "isFalseTouch", int.class, float.class, float.class);
+            releaseFalseTouch = withBody(NativeReflection.methodOrNull(panelClass, "isFalseTouch", int.class, float.class, float.class),
+                    keyguardClass, Members.Sig.of("isFalseTouch", int.class, float.class, float.class));
             if (releaseFalseTouch == null) {
-                releaseFalseTouch = required(NativeReflection.methodOrNull(panelClass, "isFalseTouch", float.class, float.class, int.class), "isFalseTouch");
+                releaseFalseTouch = required(withBody(NativeReflection.methodOrNull(panelClass, "isFalseTouch", float.class, float.class, int.class),
+                        keyguardClass, Members.Sig.of("isFalseTouch", float.class, float.class, int.class)), "isFalseTouch");
                 falseTouchAosp = true; features.variant("统一释放", "isFalseTouch(x,y,type)");
             }
             // MIUI fling$1(vel, collapseSpeedUp, expand, falsing); AOSP fling(vel, expand, collapseSpeedUp, falsing).
-            releaseFling = Members.suffixed(panelClass, "fling", float.class, float.class, boolean.class, boolean.class);
+            releaseFling = withBody(Members.suffixed(panelClass, "fling", float.class, float.class, boolean.class, boolean.class),
+                    keyguardClass, Members.Sig.of("fling", float.class, float.class, boolean.class, boolean.class));
             if (releaseFling == null) {
-                releaseFling = required(Members.suffixed(panelClass, "fling", float.class, boolean.class, float.class, boolean.class), "fling");
+                releaseFling = required(withBody(Members.suffixed(panelClass, "fling", float.class, boolean.class, float.class, boolean.class),
+                        keyguardClass, Members.Sig.of("fling", float.class, boolean.class, float.class, boolean.class)), "fling");
                 flingAosp = true; features.variant("统一释放", "fling(vel,expand,speed,falsing)");
             }
             releaseStop = required(Members.suffixed(panelClass, "onTrackingStopped", boolean.class), "onTrackingStopped");
@@ -243,9 +288,18 @@ final class SystemUiHooks {
                 NativeReflection.field(panelClass, name);
             for (String name : new String[]{"mShowing", "mKeyguardGoingAway", "mKeyguardFadingAway", "mCanDismissLockScreen"})
                 NativeReflection.field(type("com.android.systemui.statusbar.policy.KeyguardStateControllerImpl"), name);
-            for (String name : new String[]{"interactive", "keyguardShowing", "keyguardBouncerShowing", "keyguardOccluded",
-                    "statusBarState", "notificationShadeWindowView", "keyguardForegroundLayer"})
-                NativeReflection.field(keyguardClass, name);
+            // The keyguard host spells these with an `m` prefix on HyperOS 2 and without one on
+            // HyperOS 4; whichever shape this build has is resolved once, here.
+            kgInteractive = keyguardField(keyguardClass, "interactive", "mInteractive");
+            kgKeyguardShowing = keyguardField(keyguardClass, "keyguardShowing", "mKeyguardShowing");
+            kgKeyguardBouncerShowing = keyguardField(keyguardClass, "keyguardBouncerShowing", "mKeyguardBouncerShowing");
+            kgKeyguardOccluded = keyguardField(keyguardClass, "keyguardOccluded", "mKeyguardOccluded");
+            kgStatusBarState = keyguardField(keyguardClass, "statusBarState", "mBarState");
+            kgForegroundLayer = keyguardField(keyguardClass, "keyguardForegroundLayer", "mKeyguardForegroundLayer");
+            kgInjector = keyguardFieldOrNull(keyguardClass, "keyguardPanelViewInjector", "mKeyguardPanelViewInjector");
+            // Not every build keeps the window view as a field on this host; where it is absent the
+            // root is taken from the panel view at call time (see shadeWindowView()).
+            kgShadeWindowView = keyguardFieldOrNull(keyguardClass, "notificationShadeWindowView", "mNotificationShadeWindowView");
             NativeReflection.method(panelClass, "isTracking");
             NativeReflection.method(panelClass, "getMaxPanelTransitionDistance");
             features.log.on("面板拖动", "");
@@ -412,7 +466,7 @@ final class SystemUiHooks {
                     try {
                         sleeping = false;
                         keyguard = NativeReflection.get(chain.getThisObject(), "this$0");
-                        Object injector = NativeReflection.optGet(keyguard, "keyguardPanelViewInjector");
+                        Object injector = keyguardInjector();
                         Object owner = NativeReflection.optCall(injector, "getNotificationPanelViewController");
                         if (owner != null) capturePanel(owner);
                         reporter.keyguardFound = true;
@@ -495,7 +549,7 @@ final class SystemUiHooks {
             register(windowTouch, chain -> {
                 MotionEvent event = (MotionEvent) chain.getArg(0);
                 if (!ready || failed || keyguard == null
-                        || chain.getThisObject() != NativeReflection.get(keyguard, "notificationShadeWindowView"))
+                        || chain.getThisObject() != shadeWindowView())
                     return chain.proceed();
                 TouchDispatch.Frame frame = dispatch.enter(event.getActionMasked(), event.getDownTime(), event.getEventTime());
                 try {
@@ -537,20 +591,24 @@ final class SystemUiHooks {
                 register(NativeReflection.method(ViewGroup.class, "dispatchTouchEvent", MotionEvent.class), chain -> {
                     MotionEvent event = (MotionEvent) chain.getArg(0);
                     if (bottomDownTime < 0 || bottomDownTime != event.getDownTime() || keyguard == null
-                            || chain.getThisObject() != NativeReflection.get(keyguard, "notificationShadeWindowView")
+                            || chain.getThisObject() != shadeWindowView()
                             || !dispatch.matches(event.getActionMasked(), event.getDownTime())) return chain.proceed();
                     // An unlock already in flight owns the screen; eat the finger instead.
                     if (holdForNativeExit || nativeAuthenticationStarted) return true;
-                    // Not eligible for the Flyme motion: still the native vertical unlock, never a shortcut.
+                    // Start from the native panel's own down state so its drag sees a real DOWN ...
                     try {
                         nativeInitDown(initDownCall, event);
-                        NativeReflection.invoke(drag, NativeReflection.get(panel, "mTouchHandler"), event);
-                        return true;
+                        NativeReflection.invoke(dragCall, NativeReflection.get(panel, "mTouchHandler"), event);
                     } catch (Throwable t) { fail(t); return true; }
+                    // ... then hand the rest of the finger to the module's own gesture. Returning
+                    // true here used to keep every following MOVE out of NotificationShadeWindowView,
+                    // and this module's follow-the-finger path is driven from that view's dispatch:
+                    // the finger was reserved away from the shortcut and never reached the unlock.
+                    if (bottomTrace++ < 4) trace("bottom:yield session=" + session.touching()
+                            + " eligible=" + eligible() + " engaged=" + engaged);
+                    return chain.proceed();
                 });
                 // Second guard: MIUI routes shortcut icons, left/right shortcut swipes, double-tap and
-                // long-press editing through this injector from the panel's own touch handler, not
-                // through child views. A reserved region finger never reaches it.
                 Class<?> shortcuts = Members.load(loader, "com.android.keyguard.injector.KeyguardPanelViewInjector");
                 Method exactTouch = shortcuts == null ? null : Members.method(shortcuts, Members.Sig.of("onTouchEvent",
                         MotionEvent.class, int.class, float.class, float.class, boolean.class, boolean.class, boolean.class));
@@ -614,6 +672,10 @@ final class SystemUiHooks {
                 catch (Throwable t) { fail(t); return chain.proceed(); }
                 try { if (action == MotionEvent.ACTION_DOWN) beginGesture(event); }
                 catch (Throwable t) { fail(t); }
+                // Recorded before the two match tests below, because those tests are themselves part
+                // of why a finger can fail to take over. A recorder placed after them stayed empty
+                // for exactly the gestures it was added to explain.
+                try { noteDragGate(action == MotionEvent.ACTION_DOWN ? "down" : "move"); } catch (Throwable t) { fail(t); }
                 if (!input.matches(event.getDownTime()) || !dispatch.matches(action, event.getDownTime()))
                     return chain.proceed();
                 try {
@@ -692,8 +754,7 @@ final class SystemUiHooks {
                                 (float) chain.getArg(at + 1) - NativeReflection.number(panel, "mInitialExpandX"),
                                 (float) chain.getArg(at + 2) - NativeReflection.number(panel, "mInitialExpandY"),
                                 NativeReflection.number(panel, "mTouchSlop"))) {
-                            engaged = true; takeWakeVisuals(); stopRenderTick(); startRenderTick(); trace("release:owned-without-move"); captureLayers();
-                        }
+                            engaged = true; takeWakeVisuals(); stopRenderTick(); startRenderTick(); trace("release:owned-without-move"); captureLayers();                        }
                         if (engaged && eligible() && coordinateRelease((float) chain.getArg(at + 1), (float) chain.getArg(at + 2)))
                             return null;
                     }
@@ -820,6 +881,45 @@ final class SystemUiHooks {
         if (member == null) throw new IllegalStateException(what + " missing");
         return member;
     }
+    /**
+     * The same member, but one that has a body. An abstract declaration has nothing to hook and is
+     * not the method an instance runs, so a build that declares the AOSP name abstract on the
+     * panel and implements it on the subclass that is actually instantiated is asked there instead.
+     */
+    private static Method withBody(Method resolved, Class<?> keyguardClass, Members.Sig... candidates) {
+        if (resolved != null && !Modifier.isAbstract(resolved.getModifiers())) return resolved;
+        Method concrete = Members.concrete(keyguardClass, candidates);
+        return concrete != null ? concrete : resolved;
+    }
+    /** The name this build uses for a keyguard member, out of the shapes it has had. */
+    private static String keyguardField(Class<?> type, String... names) {        String found = keyguardFieldOrNull(type, names);
+        if (found == null) throw new IllegalStateException(type.getName() + "#" + names[0] + " missing");
+        return found;
+    }
+    private static String keyguardFieldOrNull(Class<?> type, String... names) {
+        for (String name : names) if (NativeReflection.fieldOrNull(type, name) != null) return name;
+        return null;
+    }
+    /**
+     * The window the Shade lives in. Builds that keep it as a field on the keyguard host answer
+     * from there; where that field does not exist the panel view's own root is used, which is the
+     * same window. Null only when neither is available, which callers already read as "not ready".
+     */
+    private View shadeWindowView() {
+        if (kgShadeWindowView != null && keyguard != null) {
+            Object held = NativeReflection.optGet(keyguard, kgShadeWindowView);
+            if (held instanceof View) return (View) held;
+        }
+        Object panelView = panel == null ? null : NativeReflection.optGet(panel, "mView");
+        if (panelView instanceof View) {
+            View root = ((View) panelView).getRootView();
+            if (root != null) return root;
+        }
+        return keyguard instanceof View ? (View) keyguard : null;
+    }
+    private Object keyguardInjector() {
+        return kgInjector == null || keyguard == null ? null : NativeReflection.optGet(keyguard, kgInjector);
+    }
     /** A static method whose name contains {@code part}, with exactly these parameters (javac/D8 accessor names). */
     private static Method staticContaining(Class<?> owner, String part, Class<?>... params) {
         Method found = null;
@@ -854,7 +954,7 @@ final class SystemUiHooks {
         if (!renderScheduled) { renderScheduled = true; android.view.Choreographer.getInstance().postFrameCallback(renderTick); }
     }
     private void stopRenderTick() { android.view.Choreographer.getInstance().removeFrameCallback(renderTick); renderScheduled = false; }
-    private Context gestureContext() { return ((View) NativeReflection.get(keyguard, "notificationShadeWindowView")).getContext(); }
+    private Context gestureContext() { return (shadeWindowView()).getContext(); }
     private Class<?> type(String name) throws ClassNotFoundException { return Class.forName(name, false, loader); }
     private void register(java.lang.reflect.Executable method, XposedInterface.Hooker callback) {
         installed.add(module.hook(method).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept(callback));
@@ -864,9 +964,9 @@ final class SystemUiHooks {
     private boolean running() { return session.active() && ownedAnimator != null && ownedGeneration == session.generation(); }
     private boolean ownsVisuals() {
         boolean own = !failed && ready && targetVersion && (holdForNativeExit
-                ? !NativeReflection.bool(panel, "mDozing") && NativeReflection.bool(keyguard, "interactive")
-                    && !sleeping && !NativeReflection.bool(keyguard, "keyguardOccluded")
-                    && !NativeReflection.bool(keyguard, "keyguardBouncerShowing")
+                ? !NativeReflection.bool(panel, "mDozing") && NativeReflection.bool(keyguard, kgInteractive)
+                    && !sleeping && !NativeReflection.bool(keyguard, kgKeyguardOccluded)
+                    && !NativeReflection.bool(keyguard, kgKeyguardBouncerShowing)
                 : engaged && session.active() && eligible());
         // Release BEFORE a native wake/AOD/occlusion transform proceeds, so rollback cannot
         // overwrite the newer native transform after it has already been applied.
@@ -908,13 +1008,33 @@ final class SystemUiHooks {
         trace("drag:owned");
         captureLayers();
     }
+    /**
+     * Why a finger that is on the screen has not taken over the drag yet. The four gates above
+     * decide whether the follow-the-finger path runs at all, and a gesture that "does nothing"
+     * looks identical in the receipt whether it was never owned or owned and then reverted.
+     */
+    private void noteDragGate(String stage) {
+        String gate = !session.touching() ? "not-touching" : engaged ? "owned"
+                : !eligible() ? "not-eligible" : !upwardDrag ? "not-upward"
+                : !(boolean) NativeReflection.call(panel, "isTracking") ? "native-not-tracking" : "unknown";
+        if (gate.equals(lastDragGate)) return;
+        lastDragGate = gate;
+        if (dragJournal.size() >= 6) dragJournal.removeFirst();
+        dragJournal.addLast((SystemClock.uptimeMillis() % 100000) + " " + stage + "=" + gate);
+        // Self-contained, never appended to: a receipt that grows per frame is worse than no receipt.
+        reporter.diag = "drag=" + dragJournal + " now=" + gate
+                + " touching=" + session.touching() + " engaged=" + engaged
+                + " eligible=" + eligible() + " upward=" + upwardDrag
+                + " scene=" + reporter.scene + " wallpaperBound=" + reporter.wallpaperBound;
+    }
+    private String lastDragGate;
+    private final java.util.ArrayDeque<String> dragJournal = new java.util.ArrayDeque<>();
     private void beginGesture(MotionEvent event) {
         if (!dispatch.matches(MotionEvent.ACTION_DOWN, event.getDownTime())) return;
         if (panel == null || keyguard == null || NativeReflection.integer(panel, "mBarState") != 1) return;
         if (holdForNativeExit || nativeAuthenticationStarted) return;
         if(nativeDismissalRequested){liveScene.cancelNativeExit();nativeDismissalRequested=false;}
-        if (!input.begin(event.getDownTime(), event.getRawX(), event.getRawY())) return;
-        boolean retouch = engaged && session.active() && (running() || waitingForScene || pendingFinish == session.generation()) && eligible();
+        if (!input.begin(event.getDownTime(), event.getRawX(), event.getRawY())) return;        boolean retouch = engaged && session.active() && (running() || waitingForScene || pendingFinish == session.generation()) && eligible();
         boolean prepared = warming && liveScene.nativeReady() && reporter.wallpaperBound;
         completeNativeFling(session.generation(), true);
         float carried = Float.isFinite(renderedRawHeight) && retouch ? renderedRawHeight : rawHeight;
@@ -954,7 +1074,7 @@ final class SystemUiHooks {
         engageNativeDrag();
     }
     private View[] resolveNativeLayers() {
-        View root = (View) NativeReflection.get(keyguard, "notificationShadeWindowView");
+        View root = shadeWindowView();
         // ViewRootImpl dispatch does not apply the root RenderNode's translation to input.
         // A child/ancestor inside another ViewGroup would have different input semantics.
         if (root.getParent() instanceof View) throw new IllegalStateException("Shade window is not the ViewRoot root");
@@ -984,8 +1104,8 @@ final class SystemUiHooks {
         try {
             if (!ready || failed || panel == null || keyguard == null || !session.config().enabled) return false;
             if (NativeReflection.integer(panel, "mBarState") != 1 || NativeReflection.bool(panel, "mDozing")) return false;
-            if (!NativeReflection.bool(keyguard, "interactive") || !NativeReflection.bool(keyguard, "keyguardShowing")) return false;
-            if (NativeReflection.bool(keyguard, "keyguardBouncerShowing") || NativeReflection.bool(keyguard, "keyguardOccluded")) return false;
+            if (!NativeReflection.bool(keyguard, kgInteractive) || !NativeReflection.bool(keyguard, kgKeyguardShowing)) return false;
+            if (NativeReflection.bool(keyguard, kgKeyguardBouncerShowing) || NativeReflection.bool(keyguard, kgKeyguardOccluded)) return false;
             if (!editorIdle()) return false;
             if (expanded(NativeReflection.optGet(panel, "mQsController"))) return false;
             if (expanded(NativeReflection.optGet(keyguard, "controlCenter"))) return false;
@@ -1007,15 +1127,15 @@ final class SystemUiHooks {
         if (!session.config().enabled) return blocked("配置已停用");
         if (liveScene != null && liveScene.incompatibleFramework()) return blocked("框架适配器未更新，需要重启手机");
         if(nativeDismissalRequested && !NativeReflection.bool(panel,"mDozing")
-                && NativeReflection.bool(keyguard,"interactive")
-                && !NativeReflection.bool(keyguard,"keyguardBouncerShowing")
-                && !NativeReflection.bool(keyguard,"keyguardOccluded"))return true;
+                && NativeReflection.bool(keyguard,kgInteractive)
+                && !NativeReflection.bool(keyguard,kgKeyguardBouncerShowing)
+                && !NativeReflection.bool(keyguard,kgKeyguardOccluded))return true;
         if (NativeReflection.integer(panel, "mBarState") != 1) return blocked("当前不是锁屏");
         if (NativeReflection.bool(panel, "mDozing")) return blocked("AOD 状态");
-        if (!NativeReflection.bool(keyguard, "interactive")) return blocked("锁屏不可交互");
-        if (!NativeReflection.bool(keyguard, "keyguardShowing")) return blocked("锁屏未显示");
-        if (NativeReflection.bool(keyguard, "keyguardBouncerShowing")) return blocked("原生认证界面");
-        if (NativeReflection.bool(keyguard, "keyguardOccluded")) return blocked("锁屏被其他界面遮挡");
+        if (!NativeReflection.bool(keyguard, kgInteractive)) return blocked("锁屏不可交互");
+        if (!NativeReflection.bool(keyguard, kgKeyguardShowing)) return blocked("锁屏未显示");
+        if (NativeReflection.bool(keyguard, kgKeyguardBouncerShowing)) return blocked("原生认证界面");
+        if (NativeReflection.bool(keyguard, kgKeyguardOccluded)) return blocked("锁屏被其他界面遮挡");
         // Native wake fades are visual producers, not vertical-input exclusion states. Rejecting
         // them here lost the first DOWN and handed fast UP back to the original unlock path.
         if (!editorIdle()) return blocked("锁屏编辑状态：" + NativeReflection.optGet(keyguard, "editorState"));
@@ -1038,7 +1158,7 @@ final class SystemUiHooks {
         return NativeReflection.optCallBool(controller, "getExpanded", false);
     }
     private Object moveHelper() {
-        return NativeReflection.optGet(NativeReflection.optGet(keyguard, "keyguardPanelViewInjector"), "keyguardMoveHelper");
+        return NativeReflection.optGet(keyguardInjector(), "keyguardMoveHelper");
     }
     private void takeWakeVisuals() {
         if (wakeVisualsTaken) return;
@@ -1078,7 +1198,10 @@ final class SystemUiHooks {
             reporter.releaseReason = "原生禁止手势解锁；保留原生";
             trace("release:unlock-disabled"); return false;
         }
-        VelocityTracker velocity = (VelocityTracker) NativeReflection.get(panel, "mVelocityTracker");
+        VelocityTracker velocity = (VelocityTracker) NativeReflection.optGet(panel, "mVelocityTracker");
+        // MIUI's panel subclass redeclares this field, and the tracker the driver above feeds is
+        // the one on the class that declares it, so that one is read when the shadowing is empty.
+        if (velocity == null) velocity = (VelocityTracker) NativeReflection.getOn(panel, panelType, "mVelocityTracker");
         if (velocity == null) throw new IllegalStateException("Native release VelocityTracker missing");
         velocity.computeCurrentVelocity(1000);
         float vy = velocity.getYVelocity(), vx = velocity.getXVelocity(), p = progress();
@@ -1167,15 +1290,29 @@ final class SystemUiHooks {
     }
     private View[] wallpaperRoles() {
         Object depth = NativeReflection.optGet(keyguard, "keyguardDepthInteractor");
-        return new View[]{(View) NativeReflection.get(keyguard, "keyguardForegroundLayer"),
+        return new View[]{(View) NativeReflection.get(keyguard, kgForegroundLayer),
                 (View) NativeReflection.optGet(keyguard, "keyguardBackgroundLayer"),
                 (View) NativeReflection.optGet(depth, "deductedImageView")};
     }
     private boolean canDismiss() {
         return NativeReflection.bool(NativeReflection.get(panel, "mKeyguardStateController"), "mCanDismissLockScreen");
     }
+    /**
+     * Whether the framework's "it cannot present a return window" answer ends this gesture by
+     * handing the unlock to native.
+     *
+     * <p>There is deliberately no switch here. A previous attempt made this configurable and made
+     * {@code holdForNativeExit} depend on it, which removed the escape hatch the author put in and
+     * left the module holding the scene while native waited for the module: every gesture then paid
+     * the full five second deadline before rebounding, and the reveal that the handover was
+     * covering had already happened and was lost. The working behaviour is this one, so it is the
+     * only behaviour.
+     */
+    private boolean frameworkHandsOver() {
+        return liveScene.frameworkSilent();
+    }
     private void prepareScene() {
-        View window = (View) NativeReflection.get(keyguard, "notificationShadeWindowView");
+        View window = shadeWindowView();
         if (!window.isAttachedToWindow() || window.getHeight() <= 0 || session.active() || holdForNativeExit) return;
         gestureLayers = resolveNativeLayers(); ensureFrameDriver(window);
         warming = true; wallpaperFailed = !wallpaperMotion.available();
@@ -1291,7 +1428,7 @@ final class SystemUiHooks {
         float start = rawHeight, end = expand ? full : 0, delta = end - start;
         if (Math.abs(delta) < .01f) {
             rawHeight = end;
-            NativeReflection.invoke(NativeReflection.method(panel.getClass(), "setExpandedHeightInternalAosp", float.class), panel, end);
+            NativeReflection.invoke(heightWriter, panel, end);
             queueFinish(token); return;
         }
         SpringCurve curve = new SpringCurve(session.config().stiffness,
@@ -1302,8 +1439,7 @@ final class SystemUiHooks {
             if (session.generation() != token) return;
             float f = (float) value.getAnimatedValue(); rawHeight = start + delta * curve.interpolate(f);
             frameVelocity = f >= 1 ? 0 : delta * (float) curve.velocityAtSeconds(f * curve.durationMillis / 1000.0);
-            NativeReflection.invoke(NativeReflection.method(panel.getClass(), "setExpandedHeightInternalAosp", float.class),
-                    panel, FlymeMotion.clamp(rawHeight, 0, full));
+            NativeReflection.invoke(heightWriter, panel, FlymeMotion.clamp(rawHeight, 0, full));
         });
         animator.addListener(new AnimatorListenerAdapter() {
             private boolean cancelled;
@@ -1318,7 +1454,7 @@ final class SystemUiHooks {
     private void finish(long generation) {
         if (generation != session.generation() || session.touching() || running()) return;
         if(!failed && engaged && !pendingAuthentication && progress()<=.001f){
-            if(!nativeDismissalRequested && !liveScene.frameworkSilent() && canDismiss() && dismissal.consumeNativeRequest(generation,progress())){
+            if(!nativeDismissalRequested && !frameworkHandsOver() && canDismiss() && dismissal.consumeNativeRequest(generation,progress())){
                 nativeDismissalRequested=true;waitingForScene=true;
                 sceneDeadline=SystemClock.uptimeMillis()+5000;
                 trace("native-auth:request-under-opaque-cover");liveScene.requestNativeExit(generation);
@@ -1329,6 +1465,10 @@ final class SystemUiHooks {
                     nativeAuthenticationStarted=true;
                     trace("native-auth:prepared-ack:invoke");
                     nativeShowBouncer();
+                }else if(liveScene.frameworkSilent()){
+                    // The framework answered and then stood still: this build will not present the
+                    // return window, so native owns the unlock below instead of a rebound here.
+                    trace("native-auth:no-presentable-scene");
                 }else{
                     if(SystemClock.uptimeMillis()>=sceneDeadline){reporter.releaseReason="框架覆盖准备失败，尚未交出原生控制权";recover(true);return;}
                     startRenderTick();return;
@@ -1347,7 +1487,7 @@ final class SystemUiHooks {
                 && (nativeDismissalRequested || NativeReflection.bool(NativeReflection.get(panel, "mKeyguardStateController"), "mCanDismissLockScreen"))
                 && (wallpaperFailed || !liveScene.nativeReady() || lastWallpaperProgress > .001f)
                 // No framework scene will ever be ready; native authentication takes over below.
-                && !liveScene.frameworkSilent()) {
+                && !frameworkHandsOver()) {
             if (!waitingForScene) { waitingForScene = true; sceneDeadline = SystemClock.uptimeMillis() + 5000; }
             if (nativeAuthenticationStarted || SystemClock.uptimeMillis() < sceneDeadline) {
                 stopRenderTick(); startRenderTick(); return;
@@ -1395,8 +1535,8 @@ final class SystemUiHooks {
         if (!failed && targetVersion && panel != null && keyguard != null && (pendingAuthentication || dismissal.consume(generation, progress()))) {
             Object state = NativeReflection.get(panel, "mKeyguardStateController");
             if (NativeReflection.bool(state, "mShowing") && !NativeReflection.bool(state, "mKeyguardGoingAway")
-                    && !NativeReflection.bool(state, "mKeyguardFadingAway") && NativeReflection.bool(keyguard, "interactive")
-                    && !NativeReflection.bool(keyguard, "keyguardOccluded") && !NativeReflection.bool(keyguard, "keyguardBouncerShowing")) {
+                    && !NativeReflection.bool(state, "mKeyguardFadingAway") && NativeReflection.bool(keyguard, kgInteractive)
+                    && !NativeReflection.bool(keyguard, kgKeyguardOccluded) && !NativeReflection.bool(keyguard, kgKeyguardBouncerShowing)) {
                 try {
                     boolean canDismiss = NativeReflection.bool(state, "mCanDismissLockScreen");
                     // Without the framework scene there is no cover to hold; native animates its own exit.
@@ -1422,7 +1562,7 @@ final class SystemUiHooks {
     private void restoreNativeExpansion() {
         if (!ready || failed || !targetVersion || panel == null || keyguard == null) return;
         if (NativeReflection.integer(panel, "mBarState") == 1 && !NativeReflection.bool(panel, "mDozing")
-                && NativeReflection.bool(keyguard, "interactive")) {
+                && NativeReflection.bool(keyguard, kgInteractive)) {
             // Our f=1 visual override must not survive the final native animation callback.
             // Native guards, actual panel fraction and bouncer state determine the restored values.
             restoringNativeExpansion = true;
@@ -1433,10 +1573,10 @@ final class SystemUiHooks {
     }
     private void restorePose() { try { wallpaperPose.restore(); pose.restore(); } catch (Throwable t) { failed = true; reporter.fail(t); } }
     private boolean nativeForegroundHidden() {
-        View foreground = (View) NativeReflection.get(keyguard, "keyguardForegroundLayer");
+        View foreground = (View) NativeReflection.get(keyguard, kgForegroundLayer);
         View depth = (View) NativeReflection.optGet(NativeReflection.optGet(keyguard, "keyguardDepthInteractor"), "deductedImageView");
-        return VisualHandoff.nativeHidden(NativeReflection.bool(keyguard, "keyguardShowing"),
-                NativeReflection.integer(keyguard, "statusBarState"),
+        return VisualHandoff.nativeHidden(NativeReflection.bool(keyguard, kgKeyguardShowing),
+                NativeReflection.integer(keyguard, kgStatusBarState),
                 frameWindow != null && frameWindow.getWindowVisibility() == View.VISIBLE
                         && (foreground != null && foreground.isShown() || depth != null && depth.isShown()));
     }

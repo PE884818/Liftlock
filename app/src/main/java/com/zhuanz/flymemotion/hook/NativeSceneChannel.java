@@ -36,6 +36,14 @@ final class NativeSceneChannel {
     private volatile boolean everHeard;
     private boolean revoked;
     private long latestToken;
+    // A framework adapter that IS answering but whose scene never moves: its readiness reports a
+    // return window it cannot present, so no scene will arrive either. Tracked so that case can
+    // take the same route as an adapter that never answered at all.
+    private long progressMark = Long.MIN_VALUE, progressAt;
+    private static final long SCENE_STALL_MS = 1500;
+    // The framework's own readiness report, as last received: it names whether the return window
+    // can be presented at all, which is what the handover decision below is based on.
+    private String lastReadiness = "";
     private final com.zhuanz.flymemotion.core.SceneStatusOrder order = new com.zhuanz.flymemotion.core.SceneStatusOrder();
     private long bindingEpoch = -1, windowIdentity, drawSequence = -1;
     private boolean nativeOwned;
@@ -147,8 +155,20 @@ final class NativeSceneChannel {
         target = reporter.returnTarget == null ? "NONE" : reporter.returnTarget;
         sendRevealIfAllowed();
         reporter.surfaceGeneration = intent.getLongExtra("generation", 0);
-        reporter.sceneReadiness = intent.getStringExtra("readiness");
+        noteSceneProgress();
+        lastReadiness = String.valueOf(intent.getStringExtra("readiness"));
+        reporter.sceneReadiness = lastReadiness;
         reporter.liveScene = intent.getStringExtra("status"); reporter.publish(); changed.run();
+    }
+    /**
+     * Whether anything about the scene moved on this receipt. A scene that stops moving after a
+     * native exit was requested is not going to be presented; see {@link #frameworkSilent()}.
+     */
+    private void noteSceneProgress() {
+        long mark = bindingEpoch * 31 + drawSequence * 7 + (nativeReady ? 1 : 0) * 3
+                + (nativeExitPrepared ? 1 : 0) * 5 + (mirror == null ? -1 : mirror.generation()) * 11
+                + (backdropReady ? 1 : 0) * 13;
+        if (mark != progressMark) { progressMark = mark; progressAt = SystemClock.uptimeMillis(); }
     }
     MirrorState mirror() { return mirror; }
     private final java.util.List<SurfaceControl> replaced = new java.util.ArrayList<>();
@@ -156,17 +176,38 @@ final class NativeSceneChannel {
     boolean backdropReady() { return backdropReady; }
     boolean consumeRevocation() { boolean result = revoked; revoked = false; return result; }
     boolean incompatibleFramework() { return frameworkKnown && !frameworkCompatible; }
-    /** No framework receipt at all, 1.5 s after the first request: its adapter is not running. */
+    /**
+     * Whether this build will ever present the return window. Two cases, both facts rather than
+     * guesses: no receipt at all means the framework's adapter is not running, and a readiness
+     * report that names a blocked surface with nothing presented means it is running but cannot
+     * show anything. The second is read from what the framework itself reports - a heartbeat that
+     * keeps changing says nothing about whether a frame will ever arrive.
+     */
     boolean frameworkSilent() {
-        boolean silent = !everHeard && firstBeginAt >= 0 && SystemClock.uptimeMillis() - firstBeginAt > 1500;
+        long now = SystemClock.uptimeMillis();
+        boolean unheard = !everHeard && firstBeginAt >= 0 && now - firstBeginAt > 1500;
+        boolean blocked = nativeExitRequest >= 0 && now - nativeExitRequest > 800 && cannotPresent();
+        boolean silent = unheard || blocked;
         if (silent && !silentReported) {
             silentReported = true;
-            reporter.compat.off("框架场景回执", "框架未回应；解锁交给原生动画，不带壁纸跟随");
-            reporter.liveScene = "系统框架适配器未运行：解锁由原生完成"; reporter.publish();
+            if (unheard) {
+                reporter.compat.off("框架场景回执", "框架未回应；解锁交给原生动画，不带壁纸跟随");
+                reporter.liveScene = "系统框架适配器未运行：解锁由原生完成";
+            } else {
+                reporter.compat.off("框架场景回执", "框架报告返回窗口无法呈现；解锁交给原生动画");
+                reporter.liveScene = "框架报告返回窗口无法呈现：解锁由原生完成";
+            }
+            reporter.publish();
         }
         return silent;
     }
     private boolean silentReported;
+    /** The framework's own words: nothing presented, and a surface it cannot use. */
+    private boolean cannotPresent() {
+        String r = lastReadiness;
+        if (r == null || r.isEmpty() || r.equals("null")) return false;
+        return r.contains("presented=false") && r.contains("blocker=") && !r.contains("blocker=none");
+    }
     void mirrorCommitted(long id, long generation, long layer, SurfaceControl parent, int width, int height) {
         for (SurfaceControl old : replaced) old.release(); replaced.clear();
         worker.post(() -> {
