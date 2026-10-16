@@ -117,6 +117,16 @@ final class SystemServerSceneHooks {
                 if (!lease.active(now()) && presentation.handoff() && nativeUnlockStarted() && !sleepingBarrier && interactive) lease.renewHandoff(now());
                 if (!lease.active(now()) || !allowed()) { stop("场景已回滚：超时或原生状态改变 " + allowedDetail()); return; }
                 if (!presentation.handoff() && resumedByScene != null && !inputOwnedByShade()) { stop("场景已回滚：SystemUI 输入焦点已交接"); return; }
+                // The handoff hold must not outlive its bound even while the lease keeps renewing.
+                // Without this, a handoff that never completes (no native takeover / exposure on this
+                // build) keeps the scene alive with the cover opaque forever - the desktop showing
+                // only its wallpaper, the control panel invisible behind the cover, and the swipe
+                // unresponsive - until a sleep forces the cancel path. stop() itself only re-checks
+                // the bound when it is re-invoked, and this loop re-invokes it only on lease expiry
+                // or ineligibility, both of which the renew above forestalls.
+                if (presentation.handoff() && nativeUnlockStarted() && handoffHoldExpired()) {
+                    stop("handoff 超时未取得完整回执，交回原生并退役覆盖"); return;
+                }
                 Object next = appAllowed() && safeActivity(candidate) ? candidate : null;
                 if (presentation.handoff() && safeActivity(target)) next = target;
                 if (target != next) {
@@ -1058,7 +1068,14 @@ final class SystemServerSceneHooks {
                 (boolean)invokeKeyguard("isKeyguardGoingAway"), presentation.foregroundHiddenCommitted(), rendererReady(),
                 nativeFocused, drawn, window != null && (boolean)NativeReflection.call(window,"isVisibleRequested")
                     && surfaces.nativeAncestorsShown(bufferSurface(window)), parents);
-        if (ready || nativeTakeoverConfirmed) {
+        // The cover belongs to a live scene. publishScene is also invoked from late callbacks and
+        // refreshes after the lease has been cleared, and the "else protect" branch below used to
+        // light the cover there - one more way a wallpaper mirror ended up at alpha 1 over the
+        // desktop (only-wallpaper, control panel hidden, swipe unresponsive) long after the unlock.
+        // A cleared lease must never touch the cover; retirement is the only remaining actor.
+        if (lease.id() < 0) {
+            unreadySince = 0;
+        } else if (ready || nativeTakeoverConfirmed) {
             unreadySince = 0;
             cover.reveal(true);
             if (ready && cover.exposureComplete() && presentation.handoff() && !(boolean)invokeKeyguard("isKeyguardLocked"))

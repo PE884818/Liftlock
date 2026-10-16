@@ -1151,8 +1151,14 @@ final class SystemUiHooks {
         if (NativeReflection.integer(panel, "mBarState") != 1) {
             downGate("bar-state=" + NativeReflection.integer(panel, "mBarState")); return;
         }
-        if (holdForNativeExit || nativeAuthenticationStarted) {
-            downGate("handed-over hold=" + holdForNativeExit + " auth=" + nativeAuthenticationStarted); return;
+        if (holdForNativeExit || nativeAuthenticationStarted || nativeDismissalRequested) {
+            // A committed unlock is sticky. nativeDismissalRequested means the release decision was
+            // "unlock" and the native exit is in flight; a DOWN in that window used to cancel the
+            // exit (the line below) and then bounce the sheet back to the lock screen on a mere tap
+            // before the desktop had appeared. Ignore it instead: recover()/abandon reset the flag
+            // if the exit genuinely fails (the 5s scene deadline), so this cannot wedge the gesture.
+            downGate("handed-over hold=" + holdForNativeExit + " auth=" + nativeAuthenticationStarted
+                    + " dismiss=" + nativeDismissalRequested); return;
         }
         if(nativeDismissalRequested){liveScene.cancelNativeExit();nativeDismissalRequested=false;}
         if (!input.begin(event.getDownTime(), event.getRawX(), event.getRawY())) { downGate("duplicate-down"); return; }        boolean retouch = engaged && session.active() && (running() || waitingForScene || pendingFinish == session.generation()) && eligible();
