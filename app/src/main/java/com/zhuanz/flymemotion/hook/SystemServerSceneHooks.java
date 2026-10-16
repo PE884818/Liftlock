@@ -54,6 +54,10 @@ final class SystemServerSceneHooks {
     private boolean lastReady;
     private boolean homeEngineDrawn, lockEngineDrawn;
     private long homeGeneration, lockGeneration;
+    /** How long the scene must stay un-presentable before the cover re-protects; see publishScene. */
+    private static final long COVER_RECOVER_MS = 400;
+    /** When the scene was last seen not ready; 0 while ready. */
+    private long unreadySince;
     private final com.zhuanz.flymemotion.core.SceneStatusOrder producerOrder = new com.zhuanz.flymemotion.core.SceneStatusOrder();
     private List<android.os.Bundle> producerFrames = List.of();
     // The wallpaper's frame receipt hop, counted so a silent producer is told apart from a
@@ -1055,10 +1059,21 @@ final class SystemServerSceneHooks {
                 nativeFocused, drawn, window != null && (boolean)NativeReflection.call(window,"isVisibleRequested")
                     && surfaces.nativeAncestorsShown(bufferSurface(window)), parents);
         if (ready || nativeTakeoverConfirmed) {
+            unreadySince = 0;
             cover.reveal(true);
             if (ready && cover.exposureComplete() && presentation.handoff() && !(boolean)invokeKeyguard("isKeyguardLocked"))
                 presentation.nativeOwned(surfaces.nativeAncestorsShown(bufferSurface(window)), parents);
-        } else if (cover != null) cover.protect();
+        } else if (cover != null) {
+            // Debounced re-cover. A transient readiness dip (the return window's fence and surface
+            // change while the finger is down) must not flash the square cover back over the sheet's
+            // rounded edge - that was the "corner turns square 2-3 times" flicker. But a scene that
+            // stays un-presentable must re-cover, or the transparent cover leaves the blank return
+            // window showing "only the wallpaper" until a sleep/wake resets it. Only a persistent
+            // !ready crosses the threshold.
+            long now = SystemClock.uptimeMillis();
+            if (unreadySince == 0) unreadySince = now;
+            else if (now - unreadySince >= COVER_RECOVER_MS) { unreadySince = 0; cover.protect(); }
+        }
         // The cover's own timeline. "透图没出来" and "透图出来得太晚" are different defects with
         // different fixes, and the readiness line alone cannot tell them apart because it only
         // ever shows the state at the moment it was sampled.
@@ -1412,6 +1427,14 @@ final class SystemServerSceneHooks {
         return top!=null&&(boolean)NativeReflection.call(top,"isActivityTypeHome");
     }
     private final java.util.ArrayDeque<String> exitJournal = new java.util.ArrayDeque<>();
+    /**
+     * Delay before a wallpaper reconcile runs after a sleep/wake/lock callback. miuix22 posted it at
+     * 250ms, which left the lock wallpaper off-screen (black) for the first ~300ms of a wake - the
+     * "partial black then normal" flash the author's own README says was never confirmed on device.
+     * reconcile() already skips any token still in a native transition ("busy") and retries, so a
+     * shorter delay cannot fight the animation; it just re-mounts the wallpaper sooner.
+     */
+    private static final long RECONCILE_DELAY_MS = 40;
     /** Lock-wallpaper exit decisions, published as the framework's gestureJournal. */
     /**
      * Outside a scene, every wallpaper token back under the parent and visibility WM believes it
@@ -1433,7 +1456,7 @@ final class SystemServerSceneHooks {
             }
             if (busy && attempts > 1) reconcileWallpapers(why, attempts - 1);
             exitTrace("wallpaper:reconcile " + why + (busy ? " busy" : "") + " " + done.toString().trim());
-        }), 250);
+        }), RECONCILE_DELAY_MS);
     }
     private void exitTrace(String entry) {
         if (exitJournal.size() == 12) exitJournal.removeFirst();

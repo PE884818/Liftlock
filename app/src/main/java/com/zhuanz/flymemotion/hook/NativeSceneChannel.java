@@ -34,6 +34,12 @@ final class NativeSceneChannel {
     // request has gone unanswered for a while, unlocks are handed to native without a scene.
     private volatile long firstBeginAt = -1;
     private volatile boolean everHeard;
+    /**
+     * Set once this scene has actually presented a frame. It separates "this build cannot present a
+     * return window" from "this build has not presented one yet", which the point-in-time readiness
+     * read cannot: see {@link #frameworkSilent}.
+     */
+    private volatile boolean everPresented;
     private boolean revoked;
     private long latestToken;
     // A framework adapter that IS answering but whose scene never moves: its readiness reports a
@@ -76,7 +82,7 @@ final class NativeSceneChannel {
     void begin(Context c, boolean canDismiss) {
         if (requested) { update(canDismiss); return; }
         if (firstBeginAt < 0) firstBeginAt = SystemClock.uptimeMillis();
-        requested = true; revealing = revealSent = homeDeferred = false; target = "NONE"; nativeExitPrepared=false; backdropReady = nativeReady = false; lastRequested = canDismiss;
+        requested = true; revealing = revealSent = homeDeferred = false; target = "NONE"; nativeExitPrepared=false; backdropReady = nativeReady = false; lastRequested = canDismiss; everPresented = false;
         long next = Math.max(SystemClock.uptimeMillis(), latestToken + 1); latestToken = next; expectedToken = next; order.begin(next); nativeOwned = false; bindingEpoch = -1;
         worker.post(() -> {
             if (expectedToken != next || !requested) return;
@@ -143,6 +149,7 @@ final class NativeSceneChannel {
         drawSequence = intent.getLongExtra("drawSequence", -1);
         nativeReady = intent.getBooleanExtra("ready", false) && intent.getBooleanExtra("framePresented", false)
                 && bindingEpoch > 0 && windowIdentity > 0 && drawSequence >= 0;
+        if (nativeReady) everPresented = true;
         backdropReady = mirror != null && mirror.generation() == generation
                 && intent.getBooleanExtra("backdropReady", false) && intent.getLongExtra("backdropGeneration", -1) > 0
                 && intent.getLongExtra("backdropLayer", -1) > 0;
@@ -173,20 +180,32 @@ final class NativeSceneChannel {
     MirrorState mirror() { return mirror; }
     private final java.util.List<SurfaceControl> replaced = new java.util.ArrayList<>();
     boolean nativeReady() { return nativeReady; }
+    /** Whether this scene has already presented a frame; see {@link #frameworkSilent}. */
+    boolean everPresented() { return everPresented; }
     boolean backdropReady() { return backdropReady; }
     boolean consumeRevocation() { boolean result = revoked; revoked = false; return result; }
     boolean incompatibleFramework() { return frameworkKnown && !frameworkCompatible; }
     /**
-     * Whether this build will ever present the return window. Two cases, both facts rather than
-     * guesses: no receipt at all means the framework's adapter is not running, and a readiness
-     * report that names a blocked surface with nothing presented means it is running but cannot
-     * show anything. The second is read from what the framework itself reports - a heartbeat that
-     * keeps changing says nothing about whether a frame will ever arrive.
+     * Whether this build will ever present the return window.
+     *
+     * <p>The author's version answers only the structural case - no receipt at all means its adapter
+     * is not running - and that is the case worth handing the unlock to native for. This port added a
+     * second trigger, "the framework answered but reports nothing presentable", and that one is a
+     * point-in-time read: on a healthy scene it is also true for the first few hundred milliseconds,
+     * which is all a fast swipe lasts. Handing over there costs the see-through for exactly the
+     * gesture that has the least time to build it, and it is what made a quick swipe fall back to the
+     * native unlock even after the mirror and receipt chain were fixed.
+     *
+     * <p>The added case is therefore narrowed to what it was meant to describe: a build that has
+     * <em>never</em> presented a frame in this scene. Once a frame has been presented the scene has
+     * proven it can present, so a slow receipt is waited for (the caller already bounds that wait with
+     * {@code sceneDeadline}) instead of being read as an inability. A scene that never presents -
+     * {@code blocker=invalid-window-surface}, a stopped activity - still hands over immediately.
      */
     boolean frameworkSilent() {
         long now = SystemClock.uptimeMillis();
         boolean unheard = !everHeard && firstBeginAt >= 0 && now - firstBeginAt > 1500;
-        boolean blocked = nativeExitRequest >= 0 && now - nativeExitRequest > 800 && cannotPresent();
+        boolean blocked = nativeExitRequest >= 0 && now - nativeExitRequest > 800 && cannotPresent() && !everPresented;
         boolean silent = unheard || blocked;
         if (silent && !silentReported) {
             silentReported = true;
@@ -194,8 +213,8 @@ final class NativeSceneChannel {
                 reporter.compat.off("框架场景回执", "框架未回应；解锁交给原生动画，不带壁纸跟随");
                 reporter.liveScene = "系统框架适配器未运行：解锁由原生完成";
             } else {
-                reporter.compat.off("框架场景回执", "框架报告返回窗口无法呈现；解锁交给原生动画");
-                reporter.liveScene = "框架报告返回窗口无法呈现：解锁由原生完成";
+                reporter.compat.off("框架场景回执", "框架从未呈现过返回窗口；解锁交给原生动画");
+                reporter.liveScene = "框架从未呈现返回窗口：解锁由原生完成";
             }
             reporter.publish();
         }

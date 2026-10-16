@@ -40,10 +40,27 @@ final class ServerSceneCover {
             throw new IllegalStateException("Protection cover binding unavailable");
         SurfaceControl next = mirror(source), old = cover;
         parent = nextParent; layer = nextLayer; width = w; height = h;
-        cover = next; protecting = true; retired = false; blend.protect(); armExpiry = 0; note("bind");
+        // A replacement cover inside a scene that has already revealed must stay revealed.
+        //
+        // The cover is re-bound whenever the scene stops, restarts and the mirror commits again, and
+        // this device's cover journal shows exactly that twice inside one swipe
+        // (retire, rearm, bind, retire, rearm, bind). Re-binding forced the new surface to alpha 1,
+        // so the sheet's rounded bottom corner went square and then rounded again two or three times
+        // per swipe - the flicker reported against the corner. The reveal belongs to the scene, not to
+        // one cover surface, so it is evaluated before protect() resets the blend phase and carried on.
+        boolean revealed = !protecting && !retired && blend.phase() != BackdropBlend.Phase.COVERED;
+        float carriedAlpha = revealed ? blend.alpha(fadeToken, SystemClock.uptimeMillis()) : 1f;
+        cover = next; retired = false; armExpiry = 0;
+        if (!revealed) { protecting = true; blend.protect(); note("bind"); }
         try (SurfaceControl.Transaction t = new SurfaceControl.Transaction()) {
             SurfaceControl fallback = id(pendingHome) > 0 ? pendingHome : homeCommitted && id(home) > 0 ? home : null;
-            geometry(t, next); t.setAlpha(next, 1).setVisibility(next, fallback == null && !nativeHomeCommitted);
+            geometry(t, next);
+            if (revealed) {
+                t.setAlpha(next, carriedAlpha).setVisibility(next, carriedAlpha > .01f);
+                note("bind-carried-reveal");
+            } else {
+                t.setAlpha(next, 1).setVisibility(next, fallback == null && !nativeHomeCommitted);
+            }
             if (fallback != null) { geometry(t, fallback); t.setAlpha(fallback, 1).setVisibility(fallback, true); }
             if (id(old) > 0) t.setVisibility(old, false).reparent(old, null);
             t.addTransactionCommittedListener(handler::post, () -> { if (old != null) old.release(); committed.run(); }); t.apply();
@@ -118,6 +135,12 @@ final class ServerSceneCover {
         // A re-arm waiting for a bind that never came must not keep this cover lit over the desktop.
         expireRearm();
         if (retired) { revealRefusal = "retired"; return; }
+        // No phase gate here. The debounce that decides "transient dip vs genuinely un-presentable"
+        // lives in the caller (SystemServerSceneHooks), which knows the actual readiness; this method
+        // only ever does what it is told. The earlier "ignore protect once revealing" guard fixed the
+        // corner flicker but was too strong: once the cover was EXPOSED it never re-covered, so a
+        // scene whose return window stopped drawing was left showing "only the wallpaper" (the cover
+        // transparent over a blank window) until a sleep/wake happened to reset it.
         if (!protecting) note("protect-relight");
         blend.protect(); protecting = true;
         if (nativeHomeCommitted && id(nativeHome) > 0) {
@@ -155,6 +178,13 @@ final class ServerSceneCover {
     synchronized String backdropState() {
         return "backdrop=" + backdropReady() + "/home=" + homeCommitted + "/native=" + nativeHomeCommitted
                 + "/protecting=" + protecting + "/retired=" + retired + "/bound=" + bound()
+                // Both mirror layers here are cropped to a plain rectangle (see geometry()), so while
+                // either is still partly opaque it fills the region outside the wallpaper band's
+                // rounded bottom corners, and the rounding only appears as they fade. The crop and the
+                // live fade alpha are reported so that attribution is checkable instead of guessed.
+                // cover and home share this alpha expression, so one value describes both.
+                + "/crop=0,0," + width + "," + height + "/corner=0"
+                + "/fadeAlpha=" + Math.round(blend.alpha(fadeToken, SystemClock.uptimeMillis()) * 1000) / 1000f
                 + "/coverJournal=" + journal;
     }
     /**

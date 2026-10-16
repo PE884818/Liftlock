@@ -75,6 +75,11 @@ final class SystemUiHooks {
     private boolean nativeHideRequested;
     private MotionFrame closedFrame;
     private boolean warming, completingFling;
+    /** Warm-pose retries spent waiting for the wallpaper mirror, and when the last one was issued. */
+    private int warmUnbound;
+    private long warmNudgeAt;
+    /** Minimum gap between warm-pose frame requests; see applyWarmPose. */
+    private static final long WARM_NUDGE_MS = 120;
     private long warmAppliedSession = -1, warmAppliedGeneration = -1;
     private boolean warmAppliedDismissible, warmReadyReported;
     private int warmWidth, warmHeight;
@@ -121,6 +126,26 @@ final class SystemUiHooks {
     private float rawHeight, frameVelocity, startProgress = 1, retouchOffset;
     private long sceneDeadline, sampleTime;
     private boolean renderScheduled;
+    /** Panel position last seen after release, and when it last moved; see {@link #watchSettle}. */
+    private float settleMark = -1;
+    private long settleMarkAt;
+    private long settleReported = -1;
+    /** How long a released panel may sit part-way without moving before the gesture is recovered. */
+    private static final long SETTLE_STALL_MS = 800;
+    /**
+     * How long the lock screen must stay ineligible before the warm scene is torn down.
+     *
+     * <p>mKeyguardInteractive flickers while the lock screen sits idle, so an immediate
+     * {@code abandonPose()} on the first ineligible sample restarted the warm-up forever and the
+     * mirror never committed: the receipt showed {@code scene=锁屏可接入} next to
+     * {@code wallpaper=等待框架创建锁屏引擎的实时镜像}, {@code wallpaperBound=false}, and a
+     * {@code TM:abandon ... scene=锁屏不可交互} every couple of seconds for minutes. Because the
+     * abandon path also releases a gesture with no animator, the same flicker left a released sheet
+     * parked mid-screen - the "fast swipe under half neither unlocks nor springs back" report.
+     */
+    private static final long WARM_ABANDON_MS = 600;
+    /** When this process last saw the lock screen ineligible; 0 while it is eligible. */
+    private long ineligibleSince;
     private final android.view.Choreographer.FrameCallback renderTick = new android.view.Choreographer.FrameCallback() {
         @Override public void doFrame(long frameTimeNanos) {
             renderScheduled = false;
@@ -128,7 +153,21 @@ final class SystemUiHooks {
             if(holdForNativeExit){try{applyExitPose();if(holdForNativeExit)startRenderTick();}catch(Throwable t){fail(t);}return;}
             if (!session.active() || !(engaged || lockGesture && session.touching() || pendingFinish == session.generation())) return;
             try {
-                if (!eligible()) { abandonPose(); return; }
+                boolean eligible = eligible();
+                if (!eligible) {
+                    // A flickering mKeyguardInteractive must not tear an active gesture: abandoning
+                    // mid-gesture cancels the native fling ("no rebound"), and writing the height back
+                    // corrupted progress() ("slow under-half unlocks"). Only a genuinely gone lock
+                    // screen abandons. A transient sample must NOT skip this frame either - skipping
+                    // re-parked the rebound animator on every flicker and read as a stutter - so the
+                    // pose is still driven below and only the abandon is debounced.
+                    if (trulyIneligible()) { abandonPose(); return; }
+                } else {
+                    ineligibleSince = 0;
+                }
+                // A released gesture that stops moving is stuck; see watchSettle. Checked before the
+                // pose work so a parked sheet gets driven back instead of being re-presented as it is.
+                if (!session.touching() && engaged && !nativeDismissalRequested) watchSettle();
                 // Native hides the Shade root during exit; its pre-draw callback may stop.
                 // Continue submitting the owned Surface transactions under the server cover.
                 if(nativeDismissalRequested){applyPose();if(pendingFinish==session.generation())finish(session.generation());}
@@ -138,13 +177,58 @@ final class SystemUiHooks {
         }
     };
     private long heldGeneration = -1;
+    /**
+     * True only once the lock screen has stayed ineligible for {@link #WARM_ABANDON_MS}. Shared by the
+     * warm watch and the render tick so that neither a warm scene nor an in-flight gesture is torn
+     * down by a single flickering {@code mKeyguardInteractive} sample.
+     */
+    private boolean trulyIneligible() {
+        long now = SystemClock.uptimeMillis();
+        if (ineligibleSince == 0) { ineligibleSince = now; return false; }
+        if (now - ineligibleSince >= WARM_ABANDON_MS) { ineligibleSince = 0; return true; }
+        return false;
+    }
+    /**
+     * Recover a released gesture whose panel has stopped part-way and is not moving.
+     *
+     * <p>{@code finish()} is the only caller of {@code recover()} and every one of its branches
+     * requires {@code progress() <= .001f}, i.e. the panel has to reach a rest position before any of
+     * this runs. The native height fling end is deliberately suppressed while the presented frame is
+     * awaited and then completed later by {@code completeNativeFling}; when that completion does not
+     * arrive, the sheet stays exactly where the finger left it - the half swipe that parked over the
+     * desktop and never came back. Watching for "released, still engaged, part-way, no longer moving"
+     * is independent of which of those paths failed, and recovering is the safe direction: an
+     * unfinished swipe returns to the lock screen rather than sitting between the two.
+     */
+    private void watchSettle() {
+        float p = progress();
+        long now = SystemClock.uptimeMillis();
+        if (Math.abs(p - settleMark) > .002f) { settleMark = p; settleMarkAt = now; return; }
+        if (settleMarkAt == 0) { settleMarkAt = now; return; }
+        // Only a genuinely mid-way panel is a stall. At either end the gesture is finishing on its
+        // own and the position legitimately stops changing.
+        boolean midway = p > .02f && p < .98f;
+        if (!midway || now - settleMarkAt < SETTLE_STALL_MS) return;
+        if (settleReported != session.generation()) {
+            settleReported = session.generation();
+            trace("stuck:no-move p=" + Math.round(p * 1000) / 1000f + " for=" + SETTLE_STALL_MS + "ms recover");
+        }
+        settleMarkAt = now;
+        recover(true);
+    }
     private final Runnable warmWatch = new Runnable() {
         @Override public void run() {
             if (failed) return;
             try {
                 if (ready && panel != null && keyguard != null && !session.active() && !holdForNativeExit) {
-                    if (eligible()) { if (!warming) prepareScene(); else liveScene.update(canDismiss()); }
-                    else if (warming) abandonPose();
+                    if (eligible()) {
+                        ineligibleSince = 0;
+                        if (!warming) prepareScene(); else liveScene.update(canDismiss());
+                    } else if (warming) {
+                        // Debounced: see WARM_ABANDON_MS. Only a genuinely gone lock screen may
+                        // release the warm scene; a flickering mKeyguardInteractive must not.
+                        if (trulyIneligible()) abandonPose();
+                    }
                 }
             } catch (Throwable t) { fail(t); }
             if (!failed) main.postDelayed(this, 200);
@@ -1028,17 +1112,55 @@ final class SystemUiHooks {
                 + " scene=" + reporter.scene + " wallpaperBound=" + reporter.wallpaperBound;
     }
     private String lastDragGate;
+    /**
+     * Why a DOWN never became a gesture. Kept separate from {@code blocked} because these gates run
+     * before {@code eligible()} and the scene field is still at its reporter default; a gesture that
+     * silently does nothing then leaves no trace anywhere else in the receipt.
+     */
+    private void downGate(String reason) {
+        if (reason.equals(lastDownGate)) return;
+        lastDownGate = reason;
+        if (downJournal.size() >= 4) downJournal.removeFirst();
+        downJournal.addLast((SystemClock.uptimeMillis() % 100000) + " " + reason);
+        // Also into the append-only gesture journal. reporter.diag is a single line that the
+        // self-contained "drag=" write in noteDragGate replaces wholesale, so a refused DOWN recorded
+        // only there disappeared as soon as the next swipe succeeded - exactly the intermittent
+        // failure this diagnostic exists to capture. The journal accumulates instead, and the field
+        // has its own larger receipt budget.
+        trace("down-blocked:" + reason);
+        reporter.diag = "down=" + downJournal + " touched=" + session.touching()
+                + " engaged=" + engaged + " | " + reporter.diag;
+        if (reporter.diag.length() > 1900) reporter.diag = reporter.diag.substring(0, 1900);
+    }
+    private String lastDownGate;
+    private final java.util.ArrayDeque<String> downJournal = new java.util.ArrayDeque<>();
     private final java.util.ArrayDeque<String> dragJournal = new java.util.ArrayDeque<>();
     private void beginGesture(MotionEvent event) {
-        if (!dispatch.matches(MotionEvent.ACTION_DOWN, event.getDownTime())) return;
-        if (panel == null || keyguard == null || NativeReflection.integer(panel, "mBarState") != 1) return;
-        if (holdForNativeExit || nativeAuthenticationStarted) return;
+        // These four gates return before eligible(), so nothing else in the receipt records them:
+        // blocked stays "" and scene keeps its RuntimeReporter default. A gesture that "sometimes
+        // does not fire at all" then looks identical to one that never had a touch, which is
+        // exactly the report this traces. Record which gate refused and why.
+        if (!dispatch.matches(MotionEvent.ACTION_DOWN, event.getDownTime())) {
+            // "not-a-down" on its own was a dead end: matches() also requires the tracked frame to be
+            // the outermost one and to carry the same downTime, and the sub-case decides the fix.
+            // origin() names it - outside-window (the hook never saw this DOWN), nested-window,
+            // stale-stream, or child-cancel.
+            downGate("not-a-down:" + dispatch.origin(MotionEvent.ACTION_DOWN, event.getDownTime())); return;
+        }
+        if (panel == null || keyguard == null) { downGate("no-controller"); return; }
+        if (NativeReflection.integer(panel, "mBarState") != 1) {
+            downGate("bar-state=" + NativeReflection.integer(panel, "mBarState")); return;
+        }
+        if (holdForNativeExit || nativeAuthenticationStarted) {
+            downGate("handed-over hold=" + holdForNativeExit + " auth=" + nativeAuthenticationStarted); return;
+        }
         if(nativeDismissalRequested){liveScene.cancelNativeExit();nativeDismissalRequested=false;}
-        if (!input.begin(event.getDownTime(), event.getRawX(), event.getRawY())) return;        boolean retouch = engaged && session.active() && (running() || waitingForScene || pendingFinish == session.generation()) && eligible();
+        if (!input.begin(event.getDownTime(), event.getRawX(), event.getRawY())) { downGate("duplicate-down"); return; }        boolean retouch = engaged && session.active() && (running() || waitingForScene || pendingFinish == session.generation()) && eligible();
         boolean prepared = warming && liveScene.nativeReady() && reporter.wallpaperBound;
         completeNativeFling(session.generation(), true);
         float carried = Float.isFinite(renderedRawHeight) && retouch ? renderedRawHeight : rawHeight;
         session.beginInput(); dismissal.reset(); pendingFinish = finishCommit = presentedFinish = -1; warming = false;
+        settleMark = -1; settleMarkAt = 0;
         desktopAnimation.begin(session.generation(),session.config());
         liveScene.lateDesktopAnimation(session.config().enabled&&session.config().lateDesktopAnimation&&!desktopAnimation.nativeBound());
         engaged = retouch; lockGesture = true; upwardDrag = false;
@@ -1051,7 +1173,13 @@ final class SystemUiHooks {
         retouchOffset = retouch ? carried - NativeReflection.number(panel, "mExpandedHeight") : 0;
         if (!retouch) reveal.reset(full, SystemClock.uptimeMillis(), prepared);
         stopRenderTick(); startRenderTick();
-        trace("down retouch=" + retouch + " prepared=" + prepared);
+        // Whether the scene was already usable before this finger arrived decides everything a fast
+        // swipe can show: RevealGate.sample() forces a full opaque cover until sceneReady, so a quick
+        // drag that outruns the mirror and the readiness receipt reveals nothing. Break the predicate
+        // into its parts here, because "prepared=false" alone does not say which one was missing.
+        trace("down retouch=" + retouch + " prepared=" + prepared + " warm=" + warming
+                + " bound=" + reporter.wallpaperBound + " nativeReady=" + liveScene.nativeReady()
+                + " everPresented=" + liveScene.everPresented() + " frameworkSilent=" + liveScene.frameworkSilent());
         verticalDownTime = -2;
         gestureMin = 1; gestureMax = 0; gestureApplied = false; blockedReasons.clear();
         wallpaperObservations = 0;
@@ -1286,6 +1414,8 @@ final class SystemUiHooks {
     private void requestDraw() { if (frameWindow != null) frameWindow.invalidate(); }
     private void queueFinish(long generation) {
         if (generation != session.generation() || session.touching()) return;
+        reporter.releaseReason = "TM:finish-queued p=" + Math.round(progress() * 1000) / 1000f
+                + " engaged=" + engaged + " wallet=" + reporter.wallpaperBound;
         pendingFinish = generation; requestDraw(); startRenderTick();
     }
     private View[] wallpaperRoles() {
@@ -1315,17 +1445,55 @@ final class SystemUiHooks {
         View window = shadeWindowView();
         if (!window.isAttachedToWindow() || window.getHeight() <= 0 || session.active() || holdForNativeExit) return;
         gestureLayers = resolveNativeLayers(); ensureFrameDriver(window);
+        // The nudge budget is per warm period, not per process. Resetting only on a successful bind
+        // made the 30 nudges a lifetime allowance: one idle period that spent them without the mirror
+        // committing left every later period with a budget of zero, so the wait-for-mirror remedy
+        // silently stopped working exactly in the case it was added for.
+        warmUnbound = 0;
         warming = true; wallpaperFailed = !wallpaperMotion.available();
         liveScene.lateDesktopAnimation(session.config().enabled&&session.config().lateDesktopAnimation&&!desktopAnimation.nativeBound());
         liveScene.begin(window.getContext(), canDismiss()); requestDraw();
     }
     private void applyWarmPose() {
         View window = gestureLayers[0];
+        // Nothing to warm once the wallpaper path has handed back to native: begin() would return
+        // false on every tick and the nudge budget below would be spent waiting for a mirror that
+        // is not going to be composed. prepareScene() clears this when the warm loop restarts.
+        if (wallpaperFailed) { reporter.wallpaperBound = false; return; }
         float full = ((Number) NativeReflection.call(panel, "getMaxPanelTransitionDistance")).floatValue();
         liveScene.begin(window.getContext(), canDismiss());
         boolean bound = wallpaperMotion.begin(window, liveScene, session.config().cornerRadiusDp); reporter.wallpaperBound = bound;
-        if (!bound) return;
+        if (!bound) {
+            // Keep asking for frames until the mirror appears, throttled instead of counted.
+            //
+            // The previous version spent a budget of 30 nudges and then stopped. The warm period does
+            // not end while the mirror is missing, so `warming` stayed true, `prepareScene` never ran
+            // again, and the reset added there never applied: after ~0.5 s nothing requested another
+            // frame at all. This device's receipt shows exactly that dead end - "warm=unbound
+            // waiting-mirror 等待框架创建锁屏引擎的实时镜像" repeated, followed by a real finger's
+            // "down ... warm=false bound=false nativeReady=false", i.e. the swipe arrived with no
+            // mirror bound and therefore showed no see-through whatsoever.
+            //
+            // A rate limit is what the budget was reaching for: one nudge per WARM_NUDGE_MS cannot
+            // become an invalidate -> preDraw -> invalidate loop, while still noticing a mirror that
+            // commits seconds later.
+            long now = SystemClock.uptimeMillis();
+            if (now - warmNudgeAt >= WARM_NUDGE_MS) {
+                warmNudgeAt = now;
+                if (warmUnbound == 0) {
+                    reporter.diag = "warm=unbound waiting-mirror " + reporter.wallpaper + " | " + reporter.diag;
+                    if (reporter.diag.length() > 1900) reporter.diag = reporter.diag.substring(0, 1900);
+                }
+                warmUnbound++;
+                requestDraw();
+            }
+            return;
+        }
+        warmUnbound = 0; warmNudgeAt = 0;
         NativeSceneChannel.MirrorState binding = liveScene.mirror();
+        // applyPose checks this too. begin() proved the mirror existed, but this runs on a later
+        // frame, and a null here would be an NPE that the pre-draw catch turns into a disable.
+        if (binding == null) return;
         if (renderedMirrorSession != binding.session() || renderedMirrorGeneration != binding.generation()) {
             reveal.reset(full, SystemClock.uptimeMillis());
             renderedMirrorSession = binding.session(); renderedMirrorGeneration = binding.generation();
@@ -1335,7 +1503,19 @@ final class SystemUiHooks {
         boolean dismissible = canDismiss();
         if (warmAppliedSession != binding.session() || warmAppliedGeneration != binding.generation()
                 || warmAppliedDismissible != dismissible || warmWidth != window.getWidth() || warmHeight != window.getHeight()) {
-            wallpaperMotion.apply(frame);
+            // This was the last unguarded wallpaperMotion.apply(). A composition that refuses to draw
+            // - the framework retires the mirror between begin() above and this frame - threw out to
+            // the pre-draw listener, whose catch sets failed=true; that flag is only ever set, never
+            // cleared in this class, so the whole adaptation stayed off until SystemUI restarted.
+            // composeExit degrades exactly like applyPose and applyExitPose do.
+            composeExit(frame, null);
+            if (wallpaperFailed) {
+                // The wallpaper is now native-owned and warming has nothing left to compose. Drop the
+                // flag so warmWatch can re-prepare (which clears wallpaperFailed) instead of idling
+                // until the next touch.
+                warming = false;
+                return;
+            }
             warmAppliedSession = binding.session(); warmAppliedGeneration = binding.generation();
             warmAppliedDismissible = dismissible; warmWidth = window.getWidth(); warmHeight = window.getHeight();
         }
@@ -1414,6 +1594,7 @@ final class SystemUiHooks {
         if (Math.abs(p - lastProgress) > .00001f) { reporter.motion.incrementAndGet(); lastProgress = p; }
     }
     private void recover(boolean expand) {
+        reporter.releaseReason = "TM:recover expand=" + expand + " p=" + Math.round(progress() * 1000) / 1000f;
         if(nativeAuthenticationStarted){startRenderTick();return;}
         if(nativeDismissalRequested){liveScene.cancelNativeExit();nativeDismissalRequested=false;}
         dismissal.reset(); pendingAuthentication = waitingForScene = false;
@@ -1498,7 +1679,14 @@ final class SystemUiHooks {
         // A rebound can reach native height=full before readiness has caught the presented
         // frame up. Do not let this direct finish path bypass the on-draw commit callback.
         if (!failed && engaged && pendingFinish == generation && reporter.wallpaperBound
-                && !wallpaperFailed && presentedFinish != generation) return;
+                && !wallpaperFailed && presentedFinish != generation) {
+            // Durable record: this is the one branch that can leave a released sheet parked
+            // mid-screen ("fast swipe under half neither unlocks nor springs back"), and it is
+            // invisible in the 48-event journal once the next gesture arrives.
+            reporter.releaseReason = "TM:await-wallpaper p=" + Math.round(progress() * 1000) / 1000f
+                    + " presented=" + presentedFinish + " finger=" + session.touching() + " run=" + running();
+            return;
+        }
         // Retain the same transform owner across native end listeners and authentication
         // handoff. Clearing engaged first lets the native zoom producer run in this gap.
         waitingForScene = false; stopRenderTick();
@@ -1551,13 +1739,22 @@ final class SystemUiHooks {
         }
     }
     private void abandonPose() {
+        float parked = progress();
+        reporter.releaseReason = "TM:abandon p=" + Math.round(parked * 1000) / 1000f
+                + " finger=" + session.touching() + " engaged=" + engaged + " scene=" + reporter.scene;
         if (session.touching() || engaged) trace("abandon:" + reporter.scene);
+        warmUnbound = 0; ineligibleSince = 0;
         session.endInput(session.generation()); session.finish(session.generation());
         dismissal.reset(); pendingAuthentication = waitingForScene = false;
         ValueAnimator oldAnimator = ownedAnimator; ownedAnimator = null;
         if (oldAnimator != null && oldAnimator.isRunning()) oldAnimator.cancel();
         completeNativeFling(session.generation(), true);
         stopRenderTick(); releaseVisuals(); engaged = false; input.reset();
+        // No height write-back here. Writing mExpandedHeight back to full corrupted the release
+        // decision: progress() reads the native mExpandedHeight, so a slow under-half swipe whose
+        // gesture was abandoned mid-way then released at p=1.0 and unlocked. The parked panel is
+        // instead returned by not abandoning a gesture on a transient ineligibility (see renderTick),
+        // and by the release coordinator's own rebound decision.
     }
     private void restoreNativeExpansion() {
         if (!ready || failed || !targetVersion || panel == null || keyguard == null) return;
@@ -1590,7 +1787,7 @@ final class SystemUiHooks {
             long generation = heldGeneration;
             nativeExitCommit = generation;
             trace("native-exit:hidden-frame:queued");
-            wallpaperMotion.apply(closedFrame, () -> {
+            composeExit(closedFrame, () -> {
                 if (!holdForNativeExit || heldGeneration != generation || nativeExitCommit != generation) return;
                 nativeExitCommit = -1;
                 if (!nativeForegroundHidden()) { requestDraw(); return; }
@@ -1601,7 +1798,7 @@ final class SystemUiHooks {
             if (nativeHideRequested && nativeForegroundHidden() && nativeExitCommit != heldGeneration) {
                 long token = heldGeneration;
                 nativeExitCommit = token;
-                wallpaperMotion.apply(closedFrame, () -> {
+                composeExit(closedFrame, () -> {
                     if (!holdForNativeExit || heldGeneration != token) return;
                     nativeExitCommit = -1;
                     if (nativeForegroundHidden()) { liveScene.foregroundHidden(); trace("native-exit:foreground-proof"); }
@@ -1612,8 +1809,21 @@ final class SystemUiHooks {
             // Keep the closed foreground cropped/faded until their hidden draw is queued.
             pose.apply(closedFrame.contentY(), gestureLayers);
             wallpaperPose.apply(closedFrame, pose, wallpaperRoles());
-            wallpaperMotion.apply(closedFrame);
+            composeExit(closedFrame, null);
         }
+    }
+    /**
+     * Compose one frame for the native exit.
+     *
+     * <p>The exit path must degrade like {@link #applyPose} does. Its calls were unguarded, so a
+     * composition that refused to draw - a stale or retired mirror, which happens once the mirror
+     * generation moves on or a rebuild has failed - threw out of this method into the pre-draw
+     * listener's catch, and that catch disables the entire SystemUI adaptation. A dead mirror is a
+     * wallpaper problem: hand the wallpaper back to native and let the gesture finish.
+     */
+    private void composeExit(MotionFrame frame, Runnable committed) {
+        try { wallpaperMotion.apply(frame, committed); }
+        catch (Throwable t) { failWallpaper(t); }
     }
     private void releaseVisuals() {
         boolean completed=holdForNativeExit&&liveScene!=null&&liveScene.nativeOwned();
